@@ -607,14 +607,23 @@ pub fn init(
     };
 
     // The command we're going to execute
-    const command: ?configpkg.Command = command: {
-        if (app.first) {
-            if (config.@"initial-command") |command| {
-                break :command command;
-            }
-        }
-        break :command config.command;
-    };
+    const command: ?configpkg.Command = if (app.first)
+        config.@"initial-command" orelse config.command
+    else
+        config.command;
+
+    const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "ioMode"))
+        rt_surface.ioMode() == .manual
+    else
+        false;
+    const manual_write_cb = if (comptime @hasDecl(apprt.runtime.Surface, "ioWriteCallback"))
+        rt_surface.ioWriteCallback()
+    else
+        null;
+    const manual_write_userdata = if (comptime @hasDecl(apprt.runtime.Surface, "ioWriteUserdata"))
+        rt_surface.ioWriteUserdata()
+    else
+        null;
 
     // Start our IO implementation
     // This separate block ({}) is important because our errdefers must
@@ -632,36 +641,59 @@ pub fn init(
         env.remove("GHOSTTY_LOG");
 
         // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        if (use_manual_io) {
+            var io_manual = try termio.Manual.init(alloc, .{
+                .write_cb = manual_write_cb,
+                .write_userdata = manual_write_userdata,
+            });
+            errdefer io_manual.deinit();
 
-        // Initialize our IO mailbox
-        var io_mailbox = try termio.Mailbox.initSPSC(alloc);
-        errdefer io_mailbox.deinit(alloc);
+            var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+            errdefer io_mailbox.deinit(alloc);
 
-        try termio.Termio.init(&self.io, alloc, .{
-            .size = size,
-            .full_config = config,
-            .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
-            .mailbox = io_mailbox,
-            .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
-            .renderer_mailbox = render_thread.mailbox,
-            .surface_mailbox = .{ .surface = self, .app = app_mailbox },
-        });
+            try termio.Termio.init(&self.io, alloc, .{
+                .size = size,
+                .full_config = config,
+                .config = try termio.Termio.DerivedConfig.init(alloc, config),
+                .backend = .{ .manual = io_manual },
+                .mailbox = io_mailbox,
+                .renderer_state = &self.renderer_state,
+                .renderer_wakeup = render_thread.wakeup,
+                .renderer_mailbox = render_thread.mailbox,
+                .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            });
+        } else {
+            var io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global_state.resources_dir.host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            errdefer io_exec.deinit();
+
+            // Initialize our IO mailbox
+            var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+            errdefer io_mailbox.deinit(alloc);
+
+            try termio.Termio.init(&self.io, alloc, .{
+                .size = size,
+                .full_config = config,
+                .config = try termio.Termio.DerivedConfig.init(alloc, config),
+                .backend = .{ .exec = io_exec },
+                .mailbox = io_mailbox,
+                .renderer_state = &self.renderer_state,
+                .renderer_wakeup = render_thread.wakeup,
+                .renderer_mailbox = render_thread.mailbox,
+                .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            });
+        }
     }
     // Outside the block, IO has now taken ownership of our temporary state
     // so we can just defer this and not the subcomponents.
@@ -1289,9 +1321,10 @@ fn childExitedAbnormally(
     const alloc = arena.allocator();
 
     // Build up our command for the error message
-    const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
-        .exec => |*exec| exec.subprocess.args,
-    });
+    const command = switch (self.io.backend) {
+        .exec => |*exec| try std.mem.join(alloc, " ", exec.subprocess.args),
+        .manual => "manual backend",
+    };
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
     self.renderer_state.mutex.lock();
@@ -2016,6 +2049,46 @@ pub fn hasSelection(self: *const Surface) bool {
     return self.io.terminal.screens.active.selection != null;
 }
 
+/// Start a selection anchored at the active cursor position.
+pub fn selectCursorCell(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pin = pin: {
+        // pointFromPin(.viewport, ...) can return points beyond the visible rows
+        // when the viewport includes additional written history; only anchor to
+        // the live cursor if it is truly visible in the viewport.
+        if (screen.pages.pointFromPin(.viewport, screen.cursor.page_pin.*)) |pt| {
+            if (pt.viewport.y < @as(u32, screen.pages.rows)) {
+                break :pin screen.cursor.page_pin.*;
+            }
+        }
+
+        // If we've scrolled away from the live cursor, start at the viewport origin
+        // so copy mode can select from the currently visible history.
+        break :pin screen.pages.pin(.{ .viewport = .{} }) orelse return false;
+    };
+    // Entering keyboard copy mode should not clobber clipboard contents.
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Clear the active selection, if any.
+pub fn clearSelection(self: *Surface) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.selection == null) return false;
+    try self.setSelection(null);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lock();
@@ -2438,6 +2511,12 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
+    // Resizes can arrive during UI/layout transitions where the surface is momentarily
+    // too small to fit even a single terminal cell. Rendering at a 0xN or Nx0 grid
+    // produces a transient "blank" frame. Keep the last valid size until we have
+    // a usable grid again.
+    const prev_size = self.size;
+
     // Save our screen size
     self.size.screen = size;
     self.balancePaddingIfNeeded();
@@ -2447,6 +2526,10 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     // We have to update the IO thread no matter what because we send
     // pixel-level sizing to the subprocess.
     const grid_size = self.size.grid();
+    if (grid_size.columns == 0 or grid_size.rows == 0) {
+        self.size = prev_size;
+        return;
+    }
     if (grid_size.columns < 5 and (self.size.padding.left > 0 or self.size.padding.right > 0)) {
         log.warn("WARNING: very small terminal grid detected with padding " ++
             "set. Is your padding reasonable?", .{});
@@ -5482,26 +5565,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .tab,
         ),
 
-        .set_surface_title => |v| {
-            const title = try self.alloc.dupeZ(u8, v);
-            defer self.alloc.free(title);
-            return try self.rt_app.performAction(
-                .{ .surface = self },
-                .set_title,
-                .{ .title = title },
-            );
-        },
-
-        .set_tab_title => |v| {
-            const title = try self.alloc.dupeZ(u8, v);
-            defer self.alloc.free(title);
-            return try self.rt_app.performAction(
-                .{ .surface = self },
-                .set_tab_title,
-                .{ .title = title },
-            );
-        },
-
         .clear_screen => {
             // This is a duplicate of some of the logic in termio.clearScreen
             // but we need to do this here so we can know the answer before
@@ -5962,6 +6025,26 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // Queue a render so its shown
             screen.dirty.selection = true;
             try self.queueRender();
+        },
+
+        .set_surface_title => |v| {
+            const title = try self.alloc.dupeZ(u8, v);
+            defer self.alloc.free(title);
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .set_title,
+                .{ .title = title },
+            );
+        },
+
+        .set_tab_title => |v| {
+            const title = try self.alloc.dupeZ(u8, v);
+            defer self.alloc.free(title);
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .set_tab_title,
+                .{ .title = title },
+            );
         },
     }
 

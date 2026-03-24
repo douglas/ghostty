@@ -26,6 +26,10 @@ const log = std.log.scoped(.embedded_window);
 pub const resourcesDir = internal_os.resourcesDir;
 
 pub const App = struct {
+    /// On Linux, the host (GtkGLArea) owns the GL context on the main thread.
+    /// The renderer thread must dispatch redraws back to the app thread.
+    pub const must_draw_from_app_thread = (builtin.target.os.tag == .linux);
+
     /// Because we only expect the embedding API to be used in embedded
     /// environments, the options are extern so that we can expose it
     /// directly to a C callconv and not pay for any translation costs.
@@ -50,11 +54,10 @@ pub const App = struct {
         /// Callback called to handle an action.
         action: *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool,
 
-        /// Read the clipboard value. Returns true if the clipboard request
-        /// was started and complete_clipboard_request may be called with the
-        /// given state pointer. Returns false if the clipboard request couldn't
-        /// be started (such as when no text is available for a paste request).
-        read_clipboard: *const fn (SurfaceUD, c_int, *apprt.ClipboardRequest) callconv(.c) bool,
+        /// Read the clipboard value. The return value must be preserved
+        /// by the host until the next call. If there is no valid clipboard
+        /// value then this should return null.
+        read_clipboard: *const fn (SurfaceUD, c_int, *apprt.ClipboardRequest) callconv(.c) void,
 
         /// This may be called after a read clipboard call to request
         /// confirmation that the clipboard value is safe to read. The embedder
@@ -343,6 +346,7 @@ pub const App = struct {
 pub const Platform = union(PlatformTag) {
     macos: MacOS,
     ios: IOS,
+    linux: Linux,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -356,6 +360,11 @@ pub const Platform = union(PlatformTag) {
         uiview: objc.Object,
     } else void;
 
+    pub const Linux = if (builtin.target.os.tag == .linux) struct {
+        /// The GtkGLArea pointer — host owns the GL widget and context.
+        gl_area: *anyopaque,
+    } else void;
+
     // The C ABI compatible version of this union. The tag is expected
     // to be stored elsewhere.
     pub const C = extern union {
@@ -365,6 +374,10 @@ pub const Platform = union(PlatformTag) {
 
         ios: extern struct {
             uiview: ?*anyopaque,
+        },
+
+        linux: extern struct {
+            gl_area: ?*anyopaque,
         },
     };
 
@@ -385,6 +398,13 @@ pub const Platform = union(PlatformTag) {
                     break :ios error.UIViewMustBeSet);
                 break :ios .{ .ios = .{ .uiview = uiview } };
             } else error.UnsupportedPlatform,
+
+            .linux => if (Linux != void) linux: {
+                const config = c_platform.linux;
+                const gl_area = config.gl_area orelse
+                    break :linux error.UnsupportedPlatform;
+                break :linux .{ .linux = .{ .gl_area = gl_area } };
+            } else error.UnsupportedPlatform,
         };
     }
 };
@@ -395,6 +415,7 @@ pub const PlatformTag = enum(c_int) {
 
     macos = 1,
     ios = 2,
+    linux = 3,
 };
 
 pub const EnvVar = extern struct {
@@ -405,6 +426,13 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
+pub const IoMode = enum(c_int) {
+    exec = 0,
+    manual = 1,
+};
+
+pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -414,6 +442,9 @@ pub const Surface = struct {
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
+    io_mode: IoMode = .exec,
+    io_write_cb: ?IoWriteCallback = null,
+    io_write_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -460,6 +491,15 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// IO mode for the surface.
+        io_mode: IoMode = .exec,
+
+        /// Callback invoked when Ghostty wants to write to the backend.
+        io_write_cb: ?IoWriteCallback = null,
+
+        /// Userdata passed to io_write_cb.
+        io_write_userdata: ?*anyopaque = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -474,6 +514,9 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .io_mode = opts.io_mode,
+            .io_write_cb = opts.io_write_cb,
+            .io_write_userdata = opts.io_write_userdata,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -513,15 +556,7 @@ pub const Surface = struct {
                     break :wd;
                 }
 
-                var wd_val: configpkg.WorkingDirectory = .{ .path = wd };
-                if (wd_val.finalize(config.arenaAlloc())) |_| {
-                    config.@"working-directory" = wd_val;
-                } else |err| {
-                    log.warn(
-                        "error finalizing working directory config dir={s} err={}",
-                        .{ wd_val.path, err },
-                    );
-                }
+                config.@"working-directory" = .{ .path = wd };
             }
         }
 
@@ -636,6 +671,18 @@ pub const Surface = struct {
         return self.app;
     }
 
+    pub fn ioMode(self: *const Surface) IoMode {
+        return self.io_mode;
+    }
+
+    pub fn ioWriteCallback(self: *const Surface) ?IoWriteCallback {
+        return self.io_write_cb;
+    }
+
+    pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {
+        return self.io_write_userdata;
+    }
+
     pub fn close(self: *const Surface, process_alive: bool) void {
         const func = self.app.opts.close_surface orelse {
             log.info("runtime embedder does not support closing a surface", .{});
@@ -681,16 +728,14 @@ pub const Surface = struct {
         errdefer alloc.destroy(state_ptr);
         state_ptr.* = state;
 
-        const started = self.app.opts.read_clipboard(
+        self.app.opts.read_clipboard(
             self.userdata,
             @intCast(@intFromEnum(clipboard_type)),
             state_ptr,
         );
-        if (!started) {
-            alloc.destroy(state_ptr);
-            return false;
-        }
 
+        // Embedded apprt can't synchronously check clipboard content types,
+        // so we always return true to indicate the request was started.
         return true;
     }
 
@@ -792,6 +837,11 @@ pub const Surface = struct {
     }
 
     pub fn updateSize(self: *Surface, width: u32, height: u32) void {
+        // A 0-sized surface can't be rendered and is commonly produced transiently
+        // by UI/layout systems during split/resize operations. Treat it as a no-op
+        // so we keep the last valid size/content until a real size arrives.
+        if (width == 0 or height == 0) return;
+
         // Runtimes sometimes generate superfluous resize events even
         // if the size did not actually change (SwiftUI). We check
         // that the size actually changed from what we last recorded
@@ -945,6 +995,9 @@ pub const Surface = struct {
             .font_size = font_size,
             .working_directory = working_directory,
             .context = context,
+            .io_mode = self.io_mode,
+            .io_write_cb = self.io_write_cb,
+            .io_write_userdata = self.io_write_userdata,
         };
     }
 
@@ -1603,6 +1656,22 @@ pub const CAPI = struct {
         return surface.core_surface.hasSelection();
     }
 
+    /// Start a selection at the active cursor cell.
+    export fn ghostty_surface_select_cursor_cell(surface: *Surface) bool {
+        return surface.core_surface.selectCursorCell() catch |err| {
+            log.warn("error selecting cursor cell err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Clear the active selection.
+    export fn ghostty_surface_clear_selection(surface: *Surface) bool {
+        return surface.core_surface.clearSelection() catch |err| {
+            log.warn("error clearing selection err={}", .{err});
+            return false;
+        };
+    }
+
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(
@@ -1688,6 +1757,22 @@ pub const CAPI = struct {
     /// call as soon as possible (NOW if possible).
     export fn ghostty_surface_draw(surface: *Surface) void {
         surface.draw();
+    }
+
+    /// Notify the renderer that the GL context has been recreated (e.g. after
+    /// a GtkGLArea is unrealized and re-realized due to reparenting).
+    /// The host MUST call ghostty_surface_display_unrealized first.
+    export fn ghostty_surface_display_realized(surface: *Surface) void {
+        surface.core_surface.renderer.displayRealized() catch |err| {
+            log.err("displayRealized failed err={}", .{err});
+        };
+    }
+
+    /// Notify the renderer that the GL context is about to be destroyed.
+    /// Call this BEFORE the context is destroyed (e.g. in GTK unrealize),
+    /// while the context is still current.
+    export fn ghostty_surface_display_unrealized(surface: *Surface) void {
+        surface.core_surface.renderer.displayUnrealized();
     }
 
     /// Update the size of a surface. This will trigger resize notifications
@@ -1812,6 +1897,16 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.preeditCallback(if (len == 0) null else ptr[0..len]);
+    }
+
+    /// Process output bytes as if they were read from the PTY.
+    export fn ghostty_surface_process_output(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        if (len == 0) return;
+        surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
     /// Returns true if the surface currently has mouse capturing
